@@ -1,0 +1,30 @@
+{% include "_prelude.py.j2" %}
+try:
+    proj = get_primary_project()
+    app = find_application(proj)
+    if app is None:
+        raise Exception('工程里没有 Application（设备树结构异常？），无法列出 POU')
+    step('list pous')
+    pous = []
+    for ch in iter_children(app):
+        d = {}
+        try:
+            d['name'] = str(ch.name)
+        except Exception:
+            d['name'] = '?'
+        attr, v = probe_attr(ch, ['pou_type', 'PouType', 'type', 'Type',
+                                  'object_type', 'ObjectType'])
+        if attr:
+            d['type'] = str(v)
+            d['type_attr'] = attr
+        attr, v = probe_attr(ch, ['language', 'Language',
+                                  'implementation_language',
+                                  'ImplementationLanguage'])
+        if attr:
+            d['language'] = str(v)
+            d['language_attr'] = attr
+        pous.append(d)
+    write_result({'ok': True, 'project': str(proj.path),
+                  'application': str(getattr(app, 'name', '?')), 'pous': pous})
+except Exception as e:
+    fail(e)

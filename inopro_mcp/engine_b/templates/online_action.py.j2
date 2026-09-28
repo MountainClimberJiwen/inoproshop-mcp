@@ -1,0 +1,129 @@
+{% include "_prelude.py.j2" %}
+{#- P3 在线操作模板：按 ACTION 分发。
+    基于 IScriptOnline / IScriptOnlineApplication 的已 dump 方法名实现。
+    在线语义与桌面版 CODESYS 可能略有差异，失败时自动附加对象的方法清单帮助修正。 -#}
+
+ACTION = {{ action | pystr }}
+
+
+def method_names(obj):
+    """反射获取对象方法名清单，用于失败诊断。"""
+    try:
+        t = obj.GetType()
+        return sorted(set(m.Name for m in t.GetMethods()))[:60]
+    except Exception as e:
+        return ['<reflection failed: ' + str(e)[:80] + '>']
+
+
+try:
+    proj = get_primary_project()
+    app = find_application(proj)
+    if app is None:
+        raise Exception('工程里没有 Application，无法进行在线操作')
+
+    step('online.create_online_application')
+    oa = online.create_online_application(app)
+    if oa is None:
+        raise Exception('create_online_application 返回 None')
+    log('oa type: ' + str(oa.GetType().FullName))
+
+    def guarded(call, what):
+        try:
+            return call(), None
+        except Exception as e:
+            return None, what + ' failed: ' + str(e)[:200] + \
+                ' | available: ' + ', '.join(method_names(oa)[:30])
+
+    if ACTION == 'login':
+        _, err = guarded(lambda: oa.login(), 'login')
+        if err:
+            # 可能需要先配置网关凭据
+            step('set_default_credentials retry')
+            try:
+                online.set_default_credentials('', '')
+                oa.login()
+                err = None
+            except Exception as e2:
+                err = err + ' | retry: ' + str(e2)[:150]
+        if err:
+            raise Exception(err)
+        write_result({'ok': True, 'action': ACTION})
+
+    elif ACTION == 'logout':
+        oa.logout()
+        write_result({'ok': True, 'action': ACTION})
+
+    elif ACTION == 'start':
+        r, err = guarded(lambda: oa.start(), 'start')
+        if err:
+            raise Exception(err)
+        write_result({'ok': True, 'action': ACTION, 'state': str(oa.get_application_state())})
+
+    elif ACTION == 'stop':
+        r, err = guarded(lambda: oa.stop(), 'stop')
+        if err:
+            raise Exception(err)
+        write_result({'ok': True, 'action': ACTION, 'state': str(oa.get_application_state())})
+
+    elif ACTION == 'download':
+        # 登录 → 下载 → 可选启动；download 的具体入口按可用方法自适应
+        step('login')
+        try:
+            online.set_default_credentials('', '')
+        except Exception:
+            pass
+        oa.login()
+        step('download')
+        r, err = guarded(lambda: oa.source_download(), 'source_download')
+        if err:
+            raise Exception('找不到应用下载入口。' + err)
+        {% if start_after %}
+        step('start after download')
+        try:
+            oa.start()
+        except Exception as e:
+            log('start after download failed: ' + str(e)[:150])
+        {% endif %}
+        write_result({'ok': True, 'action': ACTION, 'state': str(oa.get_application_state())})
+
+    elif ACTION == 'upload':
+        step('login')
+        try:
+            online.set_default_credentials('', '')
+        except Exception:
+            pass
+        oa.login()
+        step('upload')
+        dev = oa.get_online_device()
+        log('device type: ' + str(dev.GetType().FullName))
+        r, err = guarded(lambda: dev.upload_source(), 'device.upload_source')
+        if err:
+            # 某些版本在 application 上
+            r, err = guarded(lambda: oa.source_download(), 'oa.source_download')
+        if err:
+            raise Exception('找不到上载入口。' + err)
+        write_result({'ok': True, 'action': ACTION})
+
+    {% if action == 'force' %}
+    elif ACTION == 'force':
+        step('force {{ var_name }}')
+        oa.set_prepared_value({{ var_name | pystr }}, {{ var_literal }})
+        oa.force_prepared_values()
+        r, err = guarded(lambda: oa.read_value({{ var_name | pystr }}), 'verify read')
+        write_result({'ok': True, 'action': ACTION, 'name': {{ var_name | pystr }},
+                      'actual': str(r) if not err else 'unverified: ' + err[:120]})
+    {% endif %}
+
+    elif ACTION == 'unforce_all':
+        oa.unforce_all_values()
+        write_result({'ok': True, 'action': ACTION})
+
+    elif ACTION == 'boot':
+        oa.create_boot_application()
+        write_result({'ok': True, 'action': ACTION})
+
+    else:
+        raise Exception('未知 ACTION: ' + ACTION)
+
+except Exception as e:
+    fail(e)

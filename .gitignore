@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 引擎 B 运行时产物（生成的 IronPython 脚本与结果文件）
+inopro_mcp/engine_b/_work/
+
+# 本地配置（含现场特定映射，不入库）
+config.json
+
+# 状态文件
+.inopro_mcp/

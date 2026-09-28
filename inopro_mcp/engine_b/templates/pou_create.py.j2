@@ -1,0 +1,31 @@
+{% include "_prelude.py.j2" %}
+try:
+    proj = get_primary_project()
+    app = find_application(proj)
+    if app is None:
+        raise Exception('工程里没有 Application，无法创建 POU')
+    step('create_pou {{ pou_name }} ({{ pou_type }}/{{ language }})')
+    POU_TYPES = {'program': 1, 'functionblock': 2, 'function': 3}
+    LANG_GUIDS = {'st': None}   # None = 用脚本环境的 ImplementationLanguages.st
+    pt = POU_TYPES.get({{ pou_type | pystr }}.lower())
+    if pt is None:
+        raise Exception('未知 pou_type {{ pou_type }}，支持: ' + ', '.join(POU_TYPES))
+    lang_arg = None
+    if {{ language | pystr }}.lower() == 'st':
+        try:
+            lang_arg = ImplementationLanguages.st
+        except Exception as e:
+            log('ImplementationLanguages.st unavailable: ' + str(e)[:100])
+    try:
+        pou = app.create_pou({{ pou_name | pystr }}, pt, lang_arg)
+        log('create_pou returned')
+    except Exception as e1:
+        log('create_pou(typed) failed: ' + str(e1)[:150])
+        step('create_pou retry')
+        pou = app.create_pou({{ pou_name | pystr }}, pt, None)
+    if pou is None:
+        raise Exception('create_pou 返回 None')
+    write_result({'ok': True, 'name': {{ pou_name | pystr }},
+                  'pou_type': {{ pou_type | pystr }}, 'language': {{ language | pystr }}})
+except Exception as e:
+    fail(e)

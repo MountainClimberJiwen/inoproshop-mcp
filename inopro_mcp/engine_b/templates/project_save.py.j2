@@ -1,0 +1,19 @@
+{% include "_prelude.py.j2" %}
+try:
+    proj = get_primary_project()
+    saved = False
+    step('save on primary thread')
+    try:
+        on_primary(lambda: proj.save())
+        saved = True
+        log('save on primary OK')
+    except Exception as e:
+        log('save on primary failed: ' + str(e)[:150])
+    if not saved:
+        step('save direct')
+        proj.save()
+        saved = True
+        log('save direct OK')
+    write_result({'ok': True, 'path': str(proj.path)})
+except Exception as e:
+    fail(e)

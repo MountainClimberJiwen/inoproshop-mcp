@@ -1,0 +1,142 @@
+# -*- coding: utf-8 -*-
+{#
+  公共前奏：每个模板开头都会 include 本文件。
+  协议：脚本把执行日志逐行写入 RESULT 文件；结束时写入 ##RESULT## 标记 + JSON。
+  约定：所有模板用 fail(e) 报告错误（带当前步骤），write_result(d) 报告成功。
+#}
+import System
+import System.IO
+
+RESULT = r'{{ result_path }}'
+MARKER = '##RESULT##'
+STEP = ['init']
+
+
+def log(s):
+    try:
+        System.IO.File.AppendAllText(RESULT, str(s) + chr(10))
+    except Exception:
+        pass
+
+
+def _esc(s):
+    s = s.replace('\\', '\\\\').replace('"', '\\"')
+    s = s.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+    return '"' + s + '"'
+
+
+def dump(o):
+    """极简 JSON 序列化器（IronPython 2.7 不保证有 json 模块，自力更生）。"""
+    if o is None:
+        return 'null'
+    if o is True:
+        return 'true'
+    if o is False:
+        return 'false'
+    if isinstance(o, (int, long, float)):
+        return str(o)
+    if isinstance(o, (str, unicode)):
+        return _esc(o)
+    if isinstance(o, (list, tuple)):
+        return '[' + ','.join(dump(x) for x in o) + ']'
+    if isinstance(o, dict):
+        return '{' + ','.join(_esc(str(k)) + ':' + dump(v) for k, v in o.items()) + '}'
+    return _esc(str(o))
+
+
+def step(name):
+    STEP[0] = name
+    log('STEP ' + name)
+
+
+def write_result(d):
+    d.setdefault('step', STEP[0])
+    try:
+        System.IO.File.AppendAllText(RESULT, chr(10) + MARKER + chr(10) + dump(d))
+    except Exception as e:
+        log('write_result failed: ' + str(e))
+    try:
+        system.exit()
+    except Exception:
+        pass
+
+
+def fail(e):
+    write_result({'ok': False, 'error': str(e)[:600]})
+
+
+def on_primary(fn):
+    """在主线程执行；CoDeSys 里 save/create 等操作必须走这条路。"""
+    return system.execute_on_primary_thread(fn)
+
+
+# ---------- 公共查找助手 ----------
+
+def get_primary_project():
+    p = projects.primary
+    if p is None:
+        raise Exception('没有已打开的工程（projects.primary 为 None）')
+    return p
+
+
+def find_application(proj):
+    """三种途径找 Application：active_application → find('Application') → None。"""
+    step('find_application: active_application')
+    try:
+        app = proj.active_application
+        if app is not None:
+            return app
+    except Exception as e:
+        log('active_application failed: ' + str(e)[:150])
+    step('find_application: proj.find')
+    try:
+        apps = list(proj.find('Application', True))
+        if apps:
+            return apps[0]
+    except Exception as e:
+        log('proj.find failed: ' + str(e)[:150])
+    return None
+
+
+def iter_children(container):
+    try:
+        return list(container.get_children(False))
+    except Exception:
+        return []
+
+
+def find_child(container, name):
+    for ch in iter_children(container):
+        try:
+            if str(ch.name) == name:
+                return ch
+        except Exception:
+            pass
+    return None
+
+
+def probe_attr(obj, names):
+    """依次尝试多个候选属性名，返回 (命中名, 值)；都没有则 (None, None)。"""
+    for n in names:
+        try:
+            v = getattr(obj, n)
+            if v is not None:
+                return n, v
+        except Exception:
+            pass
+    return None, None
+
+
+{% if project_path %}
+# ---- 引擎 B 调用约定：每个调用都是全新 IDE 实例，必须先打开目标工程 ----
+step('ensure project open')
+try:
+    _target = {{ project_path | pystr }}
+    _p = projects.primary
+    if _p is None or str(_p.path).lower().replace('/', '\\') != _target.lower().replace('/', '\\'):
+        log('opening ' + _target)
+        projects.open(_target)
+        log('opened')
+except Exception as _e:
+    fail(_e)
+{% endif %}

@@ -1,0 +1,15 @@
+{% include "_prelude.py.j2" %}
+try:
+    proj = get_primary_project()
+    app = find_application(proj)
+    if app is None:
+        raise Exception('工程里没有 Application，无法删除 POU')
+    step('find pou {{ pou_name }}')
+    pou = find_child(app, {{ pou_name | pystr }})
+    if pou is None:
+        raise Exception('找不到 POU {{ pou_name }}')
+    step('remove')
+    pou.remove()
+    write_result({'ok': True, 'deleted': {{ pou_name | pystr }}})
+except Exception as e:
+    fail(e)

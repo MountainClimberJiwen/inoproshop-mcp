@@ -1,0 +1,22 @@
+{% include "_prelude.py.j2" %}
+try:
+    step('close old project')
+    try:
+        old = projects.primary
+        if old is not None:
+            old.close()
+    except Exception as e:
+        log('close old raised (ignored): ' + str(e)[:120])
+    step('create project')
+    try:
+        projects.create({{ name | pystr }}, {{ directory | pystr }})
+        log('create returned cleanly')
+    except Exception as e:
+        # 已知怪癖：create 会抛"保存不在主线程"异常，但工程其实已建好
+        log('create raised (known quirk, continue): ' + str(e)[:150])
+    proj = projects.primary
+    if proj is None:
+        raise Exception('创建后 projects.primary 仍为空，工程未建成')
+    write_result({'ok': True, 'path': str(proj.path)})
+except Exception as e:
+    fail(e)

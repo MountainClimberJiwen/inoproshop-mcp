@@ -1,0 +1,17 @@
+{% include "_prelude.py.j2" %}
+try:
+    proj = get_primary_project()
+    path = str(proj.path)
+    {% if save_first %}
+    step('save before close')
+    try:
+        on_primary(lambda: proj.save())
+        log('save OK')
+    except Exception as e:
+        log('save raised (continue closing): ' + str(e)[:150])
+    {% endif %}
+    step('close')
+    proj.close()
+    write_result({'ok': True, 'closed': path})
+except Exception as e:
+    fail(e)

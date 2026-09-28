@@ -1,0 +1,16 @@
+{
+  "safety": {
+    "level": "strict",
+    "force_enabled": false,
+    "comment": "level=permissive 时写操作免确认；force_enabled=true 才允许强制变量（最高危）"
+  },
+  "control_vars": {
+    "start": "MAIN.xStartCmd",
+    "stop": "MAIN.xStopCmd",
+    "comment": "plc_control 动作 -> PLC 命令变量（写脉冲 1->0），按实际程序修改"
+  },
+  "modbus_name_mapping": {
+    "comment": "Modbus 模式变量地址表，例: \"counter\": {\"address\": 0, \"type\": \"int16\", \"writable\": true}",
+    "counter": { "address": 0, "type": "int16", "writable": true }
+  }
+}

@@ -1,0 +1,14 @@
+{% include "_prelude.py.j2" %}
+try:
+    step('open project')
+    proj = projects.open({{ path | pystr }})
+    if proj is None:
+        proj = projects.primary
+    if proj is None:
+        raise Exception('projects.open 返回 None 且 primary 为空，工程可能未打开: ' + {{ path | pystr }})
+    step('inspect')
+    app = find_application(proj)
+    log('path=' + str(proj.path))
+    write_result({'ok': True, 'path': str(proj.path), 'has_application': app is not None})
+except Exception as e:
+    fail(e)

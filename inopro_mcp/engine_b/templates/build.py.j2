@@ -1,0 +1,52 @@
+{% include "_prelude.py.j2" %}
+try:
+    proj = get_primary_project()
+    app = find_application(proj)
+    if app is None:
+        raise Exception('工程里没有 Application，无法编译')
+
+    msgs_before = 0
+    try:
+        msgs_before = len(list(system.get_messages()))
+    except Exception:
+        pass
+
+    {% if rebuild %}
+    step('rebuild')
+    try:
+        app.rebuild()
+        log('rebuild OK')
+    except Exception as e:
+        log('rebuild failed, fallback to build: ' + str(e)[:150])
+        step('build')
+        app.build()
+    {% else %}
+    step('build')
+    try:
+        app.build()
+        log('build OK')
+    except Exception as e:
+        log('direct build failed, retry on primary thread: ' + str(e)[:150])
+        step('build on primary thread')
+        on_primary(lambda: app.build())
+    {% endif %}
+
+    step('collect messages')
+    errors, warnings, infos = [], [], []
+    try:
+        for m in list(system.get_messages())[msgs_before:]:
+            sev, txt = str(m.severity), str(m.text)
+            if 'rror' in sev:
+                errors.append(txt[:300])
+            elif 'arning' in sev:
+                warnings.append(txt[:300])
+            else:
+                infos.append(txt[:200])
+    except Exception as e:
+        log('collect messages failed: ' + str(e)[:120])
+
+    write_result({'ok': len(errors) == 0,
+                  'errors': errors, 'warnings': warnings,
+                  'infos': infos[:20], 'project': str(proj.path)})
+except Exception as e:
+    fail(e)
