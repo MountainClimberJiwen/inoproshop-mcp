@@ -1,473 +1,754 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""InoProShop / AM600 MCP Server —— 入口。
-
-运行：
-    python server.py            # 默认 stdio 传输（MCP 客户端标准接入方式）
-    python server.py --test     # 自检：列出全部工具并做一次 dry-run
-
-P1（引擎 A，PLC 直连）已实现；P2（工程/编译）与 P3（下载/在线/强制）为接口占位，
-调用会得到明确的 "未实现" 错误而不是意外行为。
 """
-from __future__ import annotations
+inoproshop-mcp — InoProShop (汇川, 基于 CODESYS V3.5) MCP server。
 
+零依赖（纯标准库）、stdio JSON-RPC。只保留与 InoProShop 交互的基础能力：
+    环境自检 / 工程备份 / 读对象 / 写对象 / 编译 / 在线连接状态。
+
+所有需要 IDE 的操作都通过 InoProShop.exe --runscript=<脚本> 在 IDE 进程内执行
+（IronPython 2.7 + scriptengine）。宿主进程必须以管理员身份运行，否则 IDE 类工具
+会因 requires elevation 失败；env_check 等不启动 IDE 的工具不受影响。
+
+用法：
+    python server.py               # 作为 stdio MCP server 运行
+    python server.py --selfcheck   # 离线自检（不启动 IDE）
+    python server.py --list-tools  # 打印工具清单
+"""
+
+from __future__ import print_function
+
+import io
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
+import time
+import traceback
 
-from fastmcp import FastMCP
+VERSION = "0.1.0"
+SERVER_NAME = "inoproshop-mcp"
 
-from inopro_mcp import engine_b, p3
-from inopro_mcp.engine_a import engine_a
-from inopro_mcp.errors import McpError, translate_exception
-from inopro_mcp.safety import check_write_allowed
-from inopro_mcp.state import SessionState
-
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-
-
-def load_config() -> dict:
-    if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+DEFAULT_EXE = r"D:\Inovance Control\InoProShop\CODESYS\Common\InoProShop.exe"
+DEFAULT_PROFILE = "InoProShop(V1.10.0.3)"
+DONE_MARKER = "_done.txt"
+DEFAULT_TIMEOUT = 180
 
 
-config = load_config()
-state = SessionState()
-mcp = FastMCP("inopro-shop-mcp")
+# --------------------------------------------------------------------------- #
+# 配置（全部可用环境变量覆盖）
+# --------------------------------------------------------------------------- #
+def _exe_path():
+    return os.environ.get("INOPRO_EXE") or DEFAULT_EXE
 
 
-def _ok(payload: dict) -> dict:
-    return {"ok": True, **payload}
+def _profile_name():
+    return os.environ.get("INOPRO_PROFILE") or DEFAULT_PROFILE
 
 
-# ================= P1：运行时（引擎 A，已实现） =================
-
-@mcp.tool()
-async def plc_connect(host: str, protocol: str = "opcua", port: int | None = None,
-                      user: str | None = None, password: str | None = None,
-                      namespace: int = 4, app_name: str | None = None,
-                      unit: int = 1, set_default: bool = True) -> dict:
-    """连接 PLC。protocol: opcua(默认,端口4840) / modbus(端口502)。
-
-    - opcua: 变量按符号名访问（如 "MAIN.counter"），namespace 默认 4，
-      app_name 是应用名前缀，连不上符号时可尝试指定
-    - modbus: 需要在 config.json 的 name_mapping 里配置变量地址表
-    返回 conn_id，后续调用可省略（用默认连接）。
-    """
+def _timeout():
     try:
-        kwargs: dict = {}
-        if protocol.lower() == "opcua":
-            kwargs = dict(user=user, password=password, namespace=namespace,
-                          app_name=app_name)
+        return int(os.environ.get("INOPRO_TIMEOUT") or DEFAULT_TIMEOUT)
+    except ValueError:
+        return DEFAULT_TIMEOUT
+
+
+# --------------------------------------------------------------------------- #
+# IDE 脚本模板（在 IDE 进程内被执行）
+# --------------------------------------------------------------------------- #
+WRAP = u'''# -*- coding: utf-8 -*-
+import io, os, traceback
+import scriptengine as se
+OUTDIR = r"__OUTDIR__"
+def wdone(msg=u"ok"):
+    try:
+        io.open(os.path.join(OUTDIR, "_done.txt"), "w", encoding="utf-8").write(msg)
+    except Exception:
+        pass
+try:
+%(body)s
+except Exception:
+    try:
+        io.open(os.path.join(OUTDIR, "_error.txt"), "w", encoding="utf-8").write(traceback.format_exc())
+    except Exception:
+        pass
+    wdone(u"error")
+'''
+
+_OPEN = (
+    u'proj = se.projects.open(r"__PROJECT__", '
+    u'update_flags=se.VersionUpdateFlags.NoUpdates | se.VersionUpdateFlags.SilentMode)\n'
+    u'app = proj.active_application\n'
+    u'if not app:\n'
+    u'    app = proj.find("Application", True)[0]\n'
+)
+
+
+def _indent(body):
+    """把脚本体整体缩进 4 空格，塞进模板的 try 块。"""
+    lines = []
+    for line in body.splitlines():
+        lines.append(("    " + line) if line.strip() else "")
+    return "\n".join(lines)
+
+
+def _render(body, project=None):
+    script = WRAP % {"body": _indent(body)}
+    if project is not None:
+        script = script.replace("__PROJECT__", project)
+    return script
+
+
+def body_list_objects(project):
+    return _OPEN + u'''
+rows = []
+
+def walk(node):
+    try:
+        name = node.get_name()
+    except Exception:
+        name = u"?"
+    decl = u""
+    impl = u""
+    try:
+        h = node.textual_declaration
+        if h:
+            try: decl = h.get_text() or u""
+            except Exception: decl = u""
+    except Exception: pass
+    try:
+        h = node.textual_implementation
+        if h:
+            try: impl = h.get_text() or u""
+            except Exception: impl = u""
+    except Exception: pass
+    if decl or impl:
+        rows.append((name, len(decl), len(impl)))
+    try:
+        for c in node.get_children(False):
+            walk(c)
+    except Exception: pass
+
+walk(app)
+with io.open(os.path.join(OUTDIR, "objects.tsv"), "w", encoding="utf-8") as f:
+    for n, d, i in rows:
+        f.write(u"%s\\t%d\\t%d\\n" % (n, d, i))
+wdone()
+'''
+
+
+def body_read_object(project):
+    return _OPEN + u'''
+name = io.open(os.path.join(OUTDIR, "meta.txt"), encoding="utf-8").read().strip()
+found = app.find(name, True)
+if not found:
+    io.open(os.path.join(OUTDIR, "_error.txt"), "w", encoding="utf-8").write(u"object not found: " + name)
+    wdone(u"error")
+else:
+    obj = found[0]
+    decl = u""
+    impl = u""
+    try:
+        h = obj.textual_declaration
+        if h:
+            try: decl = h.get_text() or u""
+            except Exception: decl = u""
+    except Exception: pass
+    try:
+        h = obj.textual_implementation
+        if h:
+            try: impl = h.get_text() or u""
+            except Exception: impl = u""
+    except Exception: pass
+    io.open(os.path.join(OUTDIR, "decl.txt"), "w", encoding="utf-8").write(decl)
+    io.open(os.path.join(OUTDIR, "impl.txt"), "w", encoding="utf-8").write(impl)
+    wdone()
+'''
+
+
+def body_write_object(project):
+    return _OPEN + u'''
+meta = io.open(os.path.join(OUTDIR, "meta.txt"), encoding="utf-8").read().strip().split("|")
+name = meta[0]
+kind = meta[1] if len(meta) > 1 and meta[1] else u"auto"
+decl = io.open(os.path.join(OUTDIR, "decl.txt"), encoding="utf-8").read()
+impl = u""
+impl_path = os.path.join(OUTDIR, "impl.txt")
+if os.path.exists(impl_path):
+    impl = io.open(impl_path, encoding="utf-8").read()
+
+created = False
+found = app.find(name, True)
+obj = found[0] if found else None
+if obj is None:
+    created = True
+    if kind == u"dut":
+        obj = app.create_dut(name=name, type=se.DutType.Structure)
+    elif kind == u"gvl":
+        obj = app.create_gvl(name=name)
+    elif kind == u"pou":
+        obj = app.create_pou(name=name, type=se.PouType.Function, language=None, return_type=u"VOID")
+    else:
+        head = decl.lstrip().upper()
+        if head.startswith(u"FUNCTION_BLOCK"):
+            obj = app.create_pou(name=name, type=se.PouType.FunctionBlock, language=None)
+        elif head.startswith(u"FUNCTION"):
+            obj = app.create_pou(name=name, type=se.PouType.Function, language=None, return_type=u"VOID")
+        elif head.startswith(u"PROGRAM"):
+            obj = app.create_pou(name=name, type=se.PouType.Program, language=None)
         else:
-            mapping = config.get("modbus_name_mapping") or {}
-            kwargs = dict(unit=unit, name_mapping=mapping)
-        info = await engine_a.connect(host=host, protocol=protocol, port=port, **kwargs)
-        state.remember_connection(info["conn_id"], {
-            "host": host, "protocol": protocol, "port": info.get("port"),
-        }, make_default=set_default)
-        return _ok(info)
-    except Exception as e:
-        raise translate_exception(e, "plc_connect 失败")
+            obj = app.create_pou(name=name, type=se.PouType.Function, language=None, return_type=u"VOID")
 
-
-@mcp.tool()
-async def plc_disconnect(conn_id: str | None = None) -> dict:
-    """断开 PLC 连接。不传 conn_id 则断开默认连接。"""
+if decl:
     try:
-        cid, _ = engine_a.resolve_conn(conn_id, state.default_connection)
-        await engine_a.disconnect(cid)
-        state.drop_connection(cid)
-        return _ok({"disconnected": cid})
-    except McpError:
-        raise
+        obj.textual_declaration.replace(decl)
     except Exception as e:
-        raise translate_exception(e, "plc_disconnect 失败")
+        io.open(os.path.join(OUTDIR, "_warn.txt"), "a", encoding="utf-8").write(u"decl replace: " + unicode(e) + u"\\n")
+if impl:
+    try:
+        obj.textual_implementation.replace(impl)
+    except Exception as e:
+        io.open(os.path.join(OUTDIR, "_warn.txt"), "a", encoding="utf-8").write(u"impl replace: " + unicode(e) + u"\\n")
+proj.save()
+wdone(u"created" if created else u"updated")
+'''
 
 
-@mcp.tool()
-async def plc_info(conn_id: str | None = None) -> dict:
-    """查看连接信息：当前默认连接、活跃连接数、watch 列表。"""
-    return _ok({
-        "default_connection": state.default_connection,
-        "active_connections": list(engine_a._conns),
-        "active_watches": {
-            wid: {"conn_id": w.conn_id, "variables": w.names,
-                  "records": len(w.records), "error": w.error}
-            for wid, w in engine_a._watches.items()
+def body_rebuild(project):
+    return _OPEN + u'''
+app.rebuild()
+wdone()
+'''
+
+
+def body_online(project):
+    # meta.txt: action=status|connect|login|logout / user= / password= / change_option= / delete_foreign=
+    return _OPEN + u'''
+meta = {}
+for line in io.open(os.path.join(OUTDIR, "meta.txt"), encoding="utf-8"):
+    line = line.strip()
+    if "=" in line:
+        k, v = line.split("=", 1)
+        meta[k] = v
+action = meta.get("action", u"status")
+
+def note(msg):
+    io.open(os.path.join(OUTDIR, "note.txt"), "a", encoding="utf-8").write(msg + u"\\n")
+
+if meta.get("user"):
+    try:
+        se.online.set_default_credentials(meta["user"], meta.get("password", u""))
+    except Exception as e:
+        note(u"set_default_credentials: " + unicode(e))
+
+od = None
+oa = None
+try:
+    od = se.online.create_online_device()
+except Exception as e:
+    note(u"create_online_device: " + unicode(e))
+try:
+    oa = se.online.create_online_application(app)
+except Exception as e:
+    note(u"create_online_application: " + unicode(e))
+
+def call(obj, method):
+    try:
+        return unicode(getattr(obj, method)())
+    except Exception as e:
+        return u"error: " + unicode(e)
+
+lines = []
+if action == u"status":
+    if od is not None:
+        lines.append(u"connected=" + call(od, "get_connected"))
+    if oa is not None:
+        lines.append(u"logged_in=" + call(oa, "get_is_logged_in"))
+        lines.append(u"app_state=" + call(oa, "get_application_state"))
+        lines.append(u"op_state=" + call(oa, "get_operation_state"))
+    io.open(os.path.join(OUTDIR, "status.tsv"), "w", encoding="utf-8").write(u"\\n".join(lines))
+elif action == u"connect":
+    if od is None:
+        raise RuntimeError(u"no online device")
+    od.connect()
+elif action == u"login":
+    if oa is None:
+        raise RuntimeError(u"no online application")
+    oa.login(int(meta.get("change_option", u"0")), meta.get("delete_foreign", u"false").lower() == u"true")
+elif action == u"logout":
+    if oa is None:
+        raise RuntimeError(u"no online application")
+    oa.logout()
+else:
+    raise RuntimeError(u"unknown action: " + action)
+wdone()
+'''
+
+
+# --------------------------------------------------------------------------- #
+# IDE 启动与结果收集
+# --------------------------------------------------------------------------- #
+def _launch(script_text, stage):
+    """写脚本 -> 启 IDE -> 等 _done.txt -> 返回结果。"""
+    script_path = os.path.join(stage, "runscript.py")
+    with io.open(script_path, "w", encoding="utf-8") as f:
+        f.write(script_text)
+
+    exe = _exe_path()
+    if os.name != "nt":
+        return {"ok": False, "error": "InoProShop 只能在 Windows 上运行（当前系统: %s）" % os.name}
+    if not os.path.exists(exe):
+        return {"ok": False, "error": "InoProShop.exe 不存在: %s（可用 INOPRO_EXE 指定）" % exe}
+
+    # 不内嵌引号：Windows subprocess 会自己加引号，内嵌引号会被二次转义
+    cmd = [exe, "--profile=" + _profile_name(), "--runscript=" + script_path]
+    # stdout/stderr 落文件：既不占用管道缓冲（不读 PIPE 会死锁），又留下排障现场
+    log_out = open(os.path.join(stage, "ide_stdout.log"), "wb")
+    log_err = open(os.path.join(stage, "ide_stderr.log"), "wb")
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=os.path.dirname(exe),
+            stdout=log_out,
+            stderr=log_err,
+            creationflags=0,  # 保留窗口，用户需要点掉 profile 选择 / 插件缺失弹窗
+        )
+    except Exception as e:
+        hint = ""
+        if "elevation" in str(e).lower() or getattr(e, "winerror", 0) == 740:
+            hint = "（请以管理员身份启动 MCP 宿主）"
+        return {"ok": False, "error": "启动 InoProShop 失败: %s%s" % (e, hint)}
+    finally:
+        log_out.close()
+        log_err.close()
+
+    marker = os.path.join(stage, DONE_MARKER)
+    deadline = time.time() + _timeout()
+    while time.time() < deadline:
+        if os.path.exists(marker):
+            return {"ok": True, "error": None}
+        if proc.poll() is not None:
+            time.sleep(1.0)
+            if os.path.exists(marker):
+                return {"ok": True, "error": None}
+            return {"ok": False, "error": "IDE 退出但没有产出结果（returncode=%s）" % proc.returncode}
+        time.sleep(1.0)
+
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    return {"ok": False, "error": "超时 %ds：IDE 未产出 %s（弹窗没点掉？）" % (_timeout(), DONE_MARKER)}
+
+
+def _safe_read(path):
+    try:
+        with io.open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+def _run(body, project, files=None, tag="call"):
+    stage = tempfile.mkdtemp(prefix="inopromcp_")
+    for name, content in (files or {}).items():
+        with io.open(os.path.join(stage, name), "w", encoding="utf-8", newline="") as f:
+            f.write(content)
+    script = _render(body, project).replace("__OUTDIR__", stage)
+    res = _launch(script, stage)
+    out = {"ok": res["ok"]}
+    if res["error"]:
+        out["error"] = res["error"]
+    err = _safe_read(os.path.join(stage, "_error.txt"))
+    if err:
+        out["ok"] = False
+        out["script_error"] = err.strip()
+    warn = _safe_read(os.path.join(stage, "_warn.txt"))
+    if warn:
+        out["warnings"] = warn.strip()
+    note = _safe_read(os.path.join(stage, "note.txt"))
+    if note:
+        out["notes"] = note.strip()
+    out["_stage"] = stage
+    return out
+
+
+def _project_ok(path):
+    if not isinstance(path, str) or not path:
+        return "project_path 必填"
+    if not path.lower().endswith(".project"):
+        return "project_path 应指向 .project 文件: %s" % path
+    if not os.path.exists(path):
+        return "工程文件不存在: %s" % path
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# 工具实现
+# --------------------------------------------------------------------------- #
+def tool_env_check(args):
+    exe = _exe_path()
+    project = args.get("project_path")
+    profiles_dir = os.path.join(os.path.dirname(os.path.dirname(exe)), "Profiles")
+    profiles = []
+    if os.path.isdir(profiles_dir):
+        profiles = sorted([n for n in os.listdir(profiles_dir) if n.lower().endswith(".profile")])
+    return {
+        "ok": True,
+        "platform": os.name,
+        "python": sys.version.split()[0],
+        "exe": exe,
+        "exe_exists": os.path.exists(exe),
+        "profile": _profile_name(),
+        "available_profiles": profiles,
+        "timeout_seconds": _timeout(),
+        "project_path": project,
+        "project_exists": os.path.exists(project) if project else None,
+        "hint": "IDE 类工具需要 MCP 宿主以管理员身份运行；profile 名以 Profiles\\*.profile 文件名为准。",
+    }
+
+
+def tool_backup_project(args):
+    src = args.get("project_path")
+    err = _project_ok(src)
+    if err:
+        return {"ok": False, "error": err}
+    backup_dir = args.get("backup_dir") or os.path.join(os.path.dirname(src), "backup")
+    os.makedirs(backup_dir, exist_ok=True)
+    folder = os.path.dirname(src)
+    base = os.path.splitext(os.path.basename(src))[0]
+    copied = []
+    for name in os.listdir(folder):
+        if name == os.path.basename(src) or name.startswith(base + ".project") or name.startswith(base + ".autosave"):
+            dst = os.path.join(backup_dir, name)
+            shutil.copy2(os.path.join(folder, name), dst)
+            copied.append(dst)
+    return {"ok": True, "backup_dir": backup_dir, "count": len(copied), "copied": copied}
+
+
+def tool_list_objects(args):
+    project = args.get("project_path")
+    err = _project_ok(project)
+    if err:
+        return {"ok": False, "error": err}
+    out = _run(body_list_objects(project), project, tag="list")
+    rows = []
+    for line in _safe_read(os.path.join(out.pop("_stage"), "objects.tsv")).splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3:
+            rows.append({"name": parts[0], "decl_len": int(parts[1]), "impl_len": int(parts[2])})
+    out["count"] = len(rows)
+    out["objects"] = rows
+    return out
+
+
+def tool_read_object(args):
+    project = args.get("project_path")
+    err = _project_ok(project)
+    if err:
+        return {"ok": False, "error": err}
+    name = args.get("name")
+    if not name:
+        return {"ok": False, "error": "name 必填（对象名，如 PLC_PRG / GVL_Main / ST_State）"}
+    out = _run(body_read_object(project), project, {"meta.txt": name}, tag="readobj")
+    stage = out.pop("_stage")
+    out["name"] = name
+    out["declaration"] = _safe_read(os.path.join(stage, "decl.txt"))
+    out["implementation"] = _safe_read(os.path.join(stage, "impl.txt"))
+    return out
+
+
+def tool_write_object(args):
+    project = args.get("project_path")
+    err = _project_ok(project)
+    if err:
+        return {"ok": False, "error": err}
+    name = args.get("name")
+    declaration = args.get("declaration")
+    if not name:
+        return {"ok": False, "error": "name 必填"}
+    if not declaration:
+        return {"ok": False, "error": "declaration 必填（声明行 + VAR..END_VAR；主体逻辑放 implementation）"}
+    kind = args.get("kind") or "auto"
+    if kind not in ("auto", "dut", "gvl", "pou"):
+        return {"ok": False, "error": "kind 只能是 auto/dut/gvl/pou"}
+    files = {"meta.txt": name + "|" + kind, "decl.txt": declaration}
+    impl = args.get("implementation")
+    if impl:
+        files["impl.txt"] = impl
+    out = _run(body_write_object(project), project, files, tag="write")
+    out.pop("_stage")
+    out["name"] = name
+    return out
+
+
+def tool_rebuild(args):
+    project = args.get("project_path")
+    err = _project_ok(project)
+    if err:
+        return {"ok": False, "error": err}
+    out = _run(body_rebuild(project), project, tag="rebuild")
+    out.pop("_stage")
+    out["note"] = "已触发 rebuild；脚本引擎不暴露编译错误/警告，需在 IDE 消息窗口查看。"
+    return out
+
+
+def tool_online(args):
+    project = args.get("project_path")
+    err = _project_ok(project)
+    if err:
+        return {"ok": False, "error": err}
+    action = args.get("action") or "status"
+    if action not in ("status", "connect", "login", "logout"):
+        return {"ok": False, "error": "action 只能是 status/connect/login/logout"}
+
+    lines = ["action=" + action]
+    for key in ("user", "password"):
+        if args.get(key):
+            lines.append("%s=%s" % (key, args[key]))
+    if action == "login":
+        lines.append("change_option=%d" % int(args.get("change_option") or 0))
+        lines.append("delete_foreign=%s" % ("true" if args.get("delete_foreign") else "false"))
+
+    out = _run(body_online(project), project, {"meta.txt": "\n".join(lines)}, tag="online")
+    stage = out.pop("_stage")
+    out["action"] = action
+    status = _safe_read(os.path.join(stage, "status.tsv"))
+    if status:
+        out["status"] = dict(
+            line.split("=", 1) for line in status.splitlines() if "=" in line
+        )
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# 工具注册
+# --------------------------------------------------------------------------- #
+TOOLS = [
+    {
+        "name": "env_check",
+        "description": "检查 InoProShop 安装路径、profile、可选工程文件是否存在（不启动 IDE）。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"project_path": {"type": "string", "description": "可选：要检查的 .project 路径"}},
         },
-        "config_file": CONFIG_PATH if os.path.exists(CONFIG_PATH) else "未找到（使用默认值）",
-    })
-
-
-@mcp.tool()
-async def read_variables(names: list[str], conn_id: str | None = None) -> dict:
-    """批量读取 PLC 变量。names 例：["MAIN.counter", "MAIN.xStart"]。"""
-    try:
-        values = await engine_a.read_variables(names, conn_id, state.default_connection)
-        return _ok({"values": values})
-    except McpError:
-        raise
-    except Exception as e:
-        raise translate_exception(e, "read_variables 失败")
-
-
-@mcp.tool()
-async def write_variable(name: str, value, conn_id: str | None = None,
-                         confirm: bool = False) -> dict:
-    """写 PLC 变量（高危，需 confirm=True）。
-
-    value 类型按 Python 值推断（bool/int/float/str），建议先 read 确认变量类型。
-    """
-    try:
-        check_write_allowed(confirm, config.get("safety"), "写 PLC 变量")
-        result = await engine_a.write_variable(name, value, conn_id,
-                                               state.default_connection)
-        return _ok(result)
-    except McpError:
-        raise
-    except Exception as e:
-        raise translate_exception(e, "write_variable 失败")
-
-
-@mcp.tool()
-async def watch_start(names: list[str], interval_ms: int = 500,
-                      conn_id: str | None = None) -> dict:
-    """启动轮询监控，返回 watch_id。用 watch_read 增量拉取，watch_stop 停止。"""
-    try:
-        return _ok(await engine_a.watch_start(names, interval_ms, conn_id,
-                                              state.default_connection))
-    except McpError:
-        raise
-    except Exception as e:
-        raise translate_exception(e, "watch_start 失败")
-
-
-@mcp.tool()
-async def watch_read(watch_id: str, since_seq: int = 0, max_records: int = 500) -> dict:
-    """读取监控记录（增量）。since_seq 传上次返回的 latest_seq 即可只拿新数据。"""
-    try:
-        result = await engine_a.watch_read(watch_id, since_seq)
-        if len(result["records"]) > max_records:
-            result["records"] = result["records"][-max_records:]
-            result["truncated"] = True
-        return _ok(result)
-    except McpError:
-        raise
-    except Exception as e:
-        raise translate_exception(e, "watch_read 失败")
-
-
-@mcp.tool()
-async def watch_stop(watch_id: str) -> dict:
-    """停止监控。"""
-    try:
-        return _ok(await engine_a.watch_stop(watch_id))
-    except McpError:
-        raise
-    except Exception as e:
-        raise translate_exception(e, "watch_stop 失败")
-
-
-@mcp.tool()
-async def plc_control(action: str, conn_id: str | None = None,
-                      confirm: bool = False) -> dict:
-    """PLC 控制（高危，需 confirm=True）：start/stop/reset 等。
-
-    动作与命令变量的映射在 config.json 的 control_vars 中配置，例如：
-        "control_vars": {"start": "MAIN.xStartCmd", "stop": "MAIN.xStopCmd"}
-    实现方式为向命令变量写脉冲（1 → 0.5s → 0），命令的具体语义由 PLC 程序决定。
-    """
-    try:
-        check_write_allowed(confirm, config.get("safety"), f"PLC 控制 {action}")
-        control_vars = config.get("control_vars") or {}
-        return _ok(await engine_a.control(action, control_vars, conn_id,
-                                          state.default_connection))
-    except McpError:
-        raise
-    except Exception as e:
-        raise translate_exception(e, "plc_control 失败")
-
-
-# ================= P2：工程 / POU / 编译（引擎 B，已实现） =================
-# 注意：引擎 B 的每次调用都会启动一个无界面 InoProShop 实例（约 30 秒），
-# 期间可能弹出 UAC 需要点"是"。
-
-def _require_project() -> str:
-    path = state.current_project
-    if not path:
-        raise McpError("没有已打开的工程：请先 project_open(path) 或 project_create(name, directory)")
-    return path
-
-
-@mcp.tool()
-def project_open(path: str) -> dict:
-    """打开工程并记为当前工程（后续 pou_*/build 隐式作用于它）。
-
-    path: 工程文件绝对路径，如 D:\\projects\\myproj.project
-    """
-    try:
-        result = engine_b.tools.project_open(path)
-        if result.get("ok"):
-            state.set("current_project", result.get("path", path))
-        return result
-    except McpError:
-        raise
-    except Exception as e:
-        raise translate_exception(e, "project_open 失败")
-
-
-@mcp.tool()
-def project_create(name: str, directory: str) -> dict:
-    """创建新工程并记为当前工程（会关闭 IDE 里已打开的工程）。"""
-    try:
-        result = engine_b.tools.project_create(name, directory)
-        if result.get("ok"):
-            state.set("current_project", result.get("path"))
-        return result
-    except McpError:
-        raise
-    except Exception as e:
-        raise translate_exception(e, "project_create 失败")
-
-
-@mcp.tool()
-def project_close(save: bool = True) -> dict:
-    """关闭当前工程（可选先保存），并清除会话中的当前工程记录。"""
-    try:
-        result = engine_b.tools.project_close(_require_project(), save=save)
-        if result.get("ok"):
-            state.set("current_project", None)
-        return result
-    except McpError:
-        raise
-    except Exception as e:
-        raise translate_exception(e, "project_close 失败")
-
-
-@mcp.tool()
-def project_save() -> dict:
-    """保存当前工程。"""
-    try:
-        return engine_b.tools.project_save(_require_project())
-    except McpError:
-        raise
-    except Exception as e:
-        raise translate_exception(e, "project_save 失败")
-
-
-@mcp.tool()
-def pou_list() -> dict:
-    """列出当前工程所有 POU（名称/类型/语言）。"""
-    try:
-        return engine_b.tools.pou_list(_require_project())
-    except McpError:
-        raise
-    except Exception as e:
-        raise translate_exception(e, "pou_list 失败")
-
-
-@mcp.tool()
-def pou_read(name: str) -> dict:
-    """读取 POU 声明区+实现区全文。name 如 "MAIN"。"""
-    try:
-        return engine_b.tools.pou_read(_require_project(), name)
-    except McpError:
-        raise
-    except Exception as e:
-        raise translate_exception(e, "pou_read 失败")
-
-
-@mcp.tool()
-def pou_write(name: str, declaration: str | None = None,
-              implementation: str | None = None) -> dict:
-    """增量写 POU 代码：只替换提供的部分，未提供的部分保持原样。
-
-    declaration: 完整声明区文本（含 PROGRAM/VAR 等，如未确定格式先 pou_read 看原文）
-    implementation: 完整实现区文本（ST 代码体）
-    """
-    try:
-        return engine_b.tools.pou_write(_require_project(), name,
-                                        declaration, implementation)
-    except McpError:
-        raise
-    except Exception as e:
-        raise translate_exception(e, "pou_write 失败")
-
-
-@mcp.tool()
-def pou_create(name: str, pou_type: str = "program", language: str = "st") -> dict:
-    """新建 POU。type: program/functionblock/function；language 目前仅 st 经过验证。"""
-    try:
-        return engine_b.tools.pou_create(_require_project(), name, pou_type, language)
-    except McpError:
-        raise
-    except Exception as e:
-        raise translate_exception(e, "pou_create 失败")
-
-
-@mcp.tool()
-def pou_delete(name: str) -> dict:
-    """删除 POU。"""
-    try:
-        return engine_b.tools.pou_delete(_require_project(), name)
-    except McpError:
-        raise
-    except Exception as e:
-        raise translate_exception(e, "pou_delete 失败")
-
-
-@mcp.tool()
-def build(rebuild: bool = False) -> dict:
-    """编译当前工程，返回结构化诊断：errors[]/warnings[]。
-
-    ok=true 表示 0 编译错误。约 30 秒（含 IDE 启动）。
-    """
-    try:
-        return engine_b.tools.build(_require_project(), rebuild=rebuild)
-    except McpError:
-        raise
-    except Exception as e:
-        raise translate_exception(e, "build 失败")
-
-
-# ================= P3：下载 / 在线 / 强制（引擎 B online，已实现） =================
-
-@mcp.tool()
-def download_to_plc(start_after: bool = False, confirm: bool = False) -> dict:
-    """编译并下载到 PLC（高危：会改变 PLC 运行内容，需 confirm=True）。
-
-    start_after: 下载完成后启动应用。
-    """
-    try:
-        check_write_allowed(confirm, config.get("safety"), "下载到 PLC")
-        return p3.download_to_plc(_require_project(), start_after=start_after)
-    except McpError:
-        raise
-    except Exception as e:
-        raise translate_exception(e, "download_to_plc 失败")
-
-
-@mcp.tool()
-def upload_from_plc() -> dict:
-    """从 PLC 上载程序到当前工程（排查现场程序与工程不一致时用）。"""
-    try:
-        return p3.upload_from_plc(_require_project())
-    except McpError:
-        raise
-    except Exception as e:
-        raise translate_exception(e, "upload_from_plc 失败")
-
-
-@mcp.tool()
-def online_login() -> dict:
-    """建立 IDE ↔ PLC 在线会话（下载/上载/控制前通常需要先 login）。"""
-    try:
-        return p3.online_login(_require_project())
-    except McpError:
-        raise
-    except Exception as e:
-        raise translate_exception(e, "online_login 失败")
-
-
-@mcp.tool()
-def online_logout() -> dict:
-    """断开在线会话。"""
-    try:
-        return p3.online_logout(_require_project())
-    except McpError:
-        raise
-    except Exception as e:
-        raise translate_exception(e, "online_logout 失败")
-
-
-@mcp.tool()
-def online_start(confirm: bool = False) -> dict:
-    """运行 PLC 应用（高危，需 confirm=True）。"""
-    try:
-        check_write_allowed(confirm, config.get("safety"), "启动 PLC 应用")
-        return p3.online_start(_require_project())
-    except McpError:
-        raise
-    except Exception as e:
-        raise translate_exception(e, "online_start 失败")
-
-
-@mcp.tool()
-def online_stop(confirm: bool = False) -> dict:
-    """停止 PLC 应用（高危，需 confirm=True）。"""
-    try:
-        check_write_allowed(confirm, config.get("safety"), "停止 PLC 应用")
-        return p3.online_stop(_require_project())
-    except McpError:
-        raise
-    except Exception as e:
-        raise translate_exception(e, "online_stop 失败")
-
-
-@mcp.tool()
-def force_variable(name: str, value, confirm: bool = False) -> dict:
-    """强制变量（最高危：绕过 PLC 逻辑直写物理量）。
-
-    默认禁用：需在 config.json 设置 safety.force_enabled=true；
-    每次调用仍需 confirm=True。
-    """
-    try:
-        from inopro_mcp.safety import check_force_allowed
-        check_force_allowed(config.get("safety"))
-        check_write_allowed(confirm, config.get("safety"), "强制变量")
-        return p3.force_variable(_require_project(), name, value)
-    except McpError:
-        raise
-    except Exception as e:
-        raise translate_exception(e, "force_variable 失败")
-
-
-@mcp.tool()
-def unforce_all(confirm: bool = False) -> dict:
-    """解除全部强制变量（恢复程序控制，属修正性操作，但仍需确认）。"""
-    try:
-        check_write_allowed(confirm, config.get("safety"), "解除全部强制")
-        return p3.unforce_all(_require_project())
-    except McpError:
-        raise
-    except Exception as e:
-        raise translate_exception(e, "unforce_all 失败")
-
-
-@mcp.tool()
-def create_boot_application() -> dict:
-    """生成引导应用（写入 PLC 闪存，断电后程序保留）。"""
-    try:
-        return p3.create_boot_application(_require_project())
-    except McpError:
-        raise
-    except Exception as e:
-        raise translate_exception(e, "create_boot_application 失败")
-
-
-# ================= 入口 =================
-
-def self_test() -> None:
-    import asyncio
-    import inspect
-
-    tools = mcp.list_tools()
-    if inspect.iscoroutine(tools):
-        tools = asyncio.new_event_loop().run_until_complete(tools)
-    print(f"self-test: {len(tools)} tools registered")
-    for t in tools:
-        print(" -", t.name)
-    # 状态文件读写检查
-    state.set("_self_test", "ok")
-    assert state.get("_self_test") == "ok"
-    print("state file:", state.path)
-    print("self-test PASSED")
+        "fn": tool_env_check,
+    },
+    {
+        "name": "backup_project",
+        "description": "备份 .project 及其 .projectbackup/.autosave 到指定目录（写工程前建议先做）。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_path": {"type": "string", "description": ".project 文件绝对路径"},
+                "backup_dir": {"type": "string", "description": "备份目录，默认工程目录下 backup/"},
+            },
+            "required": ["project_path"],
+        },
+        "fn": tool_backup_project,
+    },
+    {
+        "name": "list_objects",
+        "description": "列出工程中所有 DUT/GVL/POU 及声明、实现长度（启动 IDE）。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"project_path": {"type": "string"}},
+            "required": ["project_path"],
+        },
+        "fn": tool_list_objects,
+    },
+    {
+        "name": "read_object",
+        "description": "读单个对象的声明 + 实现全文（启动 IDE）。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_path": {"type": "string"},
+                "name": {"type": "string", "description": "对象名，如 PLC_PRG"},
+            },
+            "required": ["project_path", "name"],
+        },
+        "fn": tool_read_object,
+    },
+    {
+        "name": "write_object",
+        "description": "创建或覆盖一个对象的声明/实现并保存工程（启动 IDE）。声明放 declaration，BEGIN 之后的主体逻辑放 implementation。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_path": {"type": "string"},
+                "name": {"type": "string"},
+                "declaration": {"type": "string", "description": "POU 声明行 + VAR..END_VAR；或 DUT/GVL 全文"},
+                "implementation": {"type": "string", "description": "可选：BEGIN 之后的主体逻辑"},
+                "kind": {"type": "string", "enum": ["auto", "dut", "gvl", "pou"], "default": "auto"},
+            },
+            "required": ["project_path", "name", "declaration"],
+        },
+        "fn": tool_write_object,
+    },
+    {
+        "name": "rebuild",
+        "description": "触发一次 rebuild（启动 IDE）。不返回编译错误，错误需在 IDE 消息窗口看。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"project_path": {"type": "string"}},
+            "required": ["project_path"],
+        },
+        "fn": tool_rebuild,
+    },
+    {
+        "name": "online",
+        "description": "与 PLC 的在线连接：action=status 读连接/登录状态，connect 连接设备，login 登录应用，logout 退出登录。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_path": {"type": "string"},
+                "action": {"type": "string", "enum": ["status", "connect", "login", "logout"], "default": "status"},
+                "user": {"type": "string", "description": "可选：PLC 登录用户名"},
+                "password": {"type": "string", "description": "可选：PLC 登录密码"},
+                "change_option": {"type": "integer", "enum": [0, 1, 2], "default": 0,
+                                  "description": "OnlineChangeOption：0 Never / 1 Try / 2 Force"},
+                "delete_foreign": {"type": "boolean", "default": False},
+            },
+            "required": ["project_path"],
+        },
+        "fn": tool_online,
+    },
+]
+
+TOOL_MAP = dict((t["name"], t["fn"]) for t in TOOLS)
+
+
+# --------------------------------------------------------------------------- #
+# JSON-RPC stdio 循环
+# --------------------------------------------------------------------------- #
+def _send(obj):
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def _result(rid, payload, is_error=False):
+    return {
+        "jsonrpc": "2.0", "id": rid,
+        "result": {
+            "isError": is_error,
+            "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2)}],
+        },
+    }
+
+
+def handle(req):
+    method = req.get("method")
+    rid = req.get("id")
+    params = req.get("params") or {}
+
+    if method == "initialize":
+        return {"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": SERVER_NAME, "version": VERSION},
+        }}
+    if method == "notifications/initialized":
+        return None
+    if method == "ping":
+        return {"jsonrpc": "2.0", "id": rid, "result": {}}
+    if method == "tools/list":
+        return {"jsonrpc": "2.0", "id": rid, "result": {"tools": [
+            {"name": t["name"], "description": t["description"], "inputSchema": t["inputSchema"]}
+            for t in TOOLS
+        ]}}
+    if method == "tools/call":
+        name = params.get("name")
+        fn = TOOL_MAP.get(name)
+        if fn is None:
+            return {"jsonrpc": "2.0", "id": rid,
+                    "error": {"code": -32601, "message": "unknown tool: %s" % name}}
+        try:
+            return _result(rid, fn(params.get("arguments") or {}))
+        except Exception as e:
+            return _result(rid, {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}, is_error=True)
+    return {"jsonrpc": "2.0", "id": rid,
+            "error": {"code": -32601, "message": "unknown method: %s" % method}}
+
+
+def serve():
+    for attr in ("stdin", "stdout"):
+        stream = getattr(sys, attr)
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8")
+            except Exception:
+                pass
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except Exception:
+            continue
+        resp = handle(req)
+        if resp is not None:
+            _send(resp)
+
+
+# --------------------------------------------------------------------------- #
+# 命令行
+# --------------------------------------------------------------------------- #
+def selfcheck():
+    checks = []
+
+    init = handle({"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+    checks.append(("initialize", init["result"]["serverInfo"]["name"] == SERVER_NAME))
+
+    listing = handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]
+    checks.append(("tools registered (%d)" % len(listing), len(listing) == len(TOOLS)))
+
+    call = handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                   "params": {"name": "env_check", "arguments": {}}})
+    payload = json.loads(call["result"]["content"][0]["text"])
+    checks.append(("env_check runs", payload.get("ok") is True))
+
+    demo = "C:/demo/Test.project"
+    rendered = _render(body_write_object(demo), demo).replace("__OUTDIR__", "C:/tmp/stage")
+    checks.append(("template rendered", "__OUTDIR__" not in rendered and "se.projects.open" in rendered))
+    checks.append(("indent preserved", "\n    proj = se.projects.open" in rendered))
+
+    bad = handle({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                  "params": {"name": "read_object", "arguments": {"project_path": "x.txt"}}})
+    bad_payload = json.loads(bad["result"]["content"][0]["text"])
+    checks.append(("invalid project rejected", bad_payload.get("ok") is False))
+
+    failed = 0
+    for name, ok in checks:
+        print("%-32s %s" % (name, "OK" if ok else "FAIL"))
+        failed += 0 if ok else 1
+
+    print("\nSELF-CHECK PASSED" if failed == 0 else "\nSELF-CHECK FAILED (%d)" % failed)
+    return 0 if failed == 0 else 1
+
+
+def main(argv):
+    if "--selfcheck" in argv:
+        return selfcheck()
+    if "--list-tools" in argv:
+        for t in TOOLS:
+            print("%-16s %s" % (t["name"], t["description"]))
+        return 0
+    if "--version" in argv:
+        print("%s %s" % (SERVER_NAME, VERSION))
+        return 0
+    serve()
+    return 0
 
 
 if __name__ == "__main__":
-    if "--test" in sys.argv:
-        self_test()
-    else:
-        mcp.run()   # 默认 stdio
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(0)
+    except Exception:
+        traceback.print_exc()
+        sys.exit(1)

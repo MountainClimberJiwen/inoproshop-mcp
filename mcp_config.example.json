@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "inoproshop": {
+      "command": "py",
+      "args": ["C:/绝对路径/inoproshop-mcp/server.py"],
+      "env": {
+        "INOPRO_EXE": "D:\\Inovance Control\\InoProShop\\CODESYS\\Common\\InoProShop.exe",
+        "INOPRO_PROFILE": "InoProShop(V1.10.0.3)",
+        "INOPRO_TIMEOUT": "180"
+      }
+    }
+  }
+}
